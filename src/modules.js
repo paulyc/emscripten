@@ -65,8 +65,16 @@ var LibraryManager = {
       'library_path.js',
       'library_signals.js',
       'library_syscall.js',
-      'library_html5.js'
+      'library_html5.js',
+      'library_stack_trace.js',
+      'library_wasi.js'
     ];
+
+    if (!DISABLE_EXCEPTION_THROWING) {
+      libraries.push('library_exceptions.js');
+    } else {
+      libraries.push('library_exceptions_stub.js');
+    }
 
     if (!MINIMAL_RUNTIME) {
       libraries.push('library_browser.js');
@@ -78,59 +86,52 @@ var LibraryManager = {
         'library_fs.js',
         'library_memfs.js',
         'library_tty.js',
-        'library_pipefs.js',
+        'library_pipefs.js', // ok to include it by default since it's only used if the syscall is used
+        'library_sockfs.js', // ok to include it by default since it's only used if the syscall is used
       ]);
 
-      // Additional filesystem libraries (in strict mode, link to these explicitly via -lxxx.js)
-      if (!STRICT) {
-        libraries = libraries.concat([
-          'library_lz4.js',
-        ]);
-        if (ENVIRONMENT_MAY_BE_WEB || ENVIRONMENT_MAY_BE_WORKER) {
-          libraries = libraries.concat([
-            'library_idbfs.js',
-            'library_proxyfs.js',
-            'library_sockfs.js',
-            'library_workerfs.js',
-          ]);
+      if (NODERAWFS) {
+        // NODERAWFS requires NODEFS
+        if (SYSTEM_JS_LIBRARIES.indexOf('library_nodefs.js') < 0) {
+          libraries.push('library_nodefs.js');
         }
-        if (ENVIRONMENT_MAY_BE_NODE) {
-          libraries = libraries.concat([
-            'library_nodefs.js',
-          ]);
-        }
-        if (NODERAWFS) {
-          libraries.push('library_noderawfs.js')
-        }
+        libraries.push('library_noderawfs.js');
       }
     }
 
-    // Additional JS libraries (in strict mode, link to these explicitly via -lxxx.js)
-    if (!STRICT) {
+    // Additional JS libraries (without AUTO_JS_LIBRARIES, link to these explicitly via -lxxx.js)
+    if (AUTO_JS_LIBRARIES) {
       libraries = libraries.concat([
         'library_webgl.js',
         'library_openal.js',
-        'library_vr.js'
+        'library_vr.js',
+        'library_sdl.js',
+        'library_glut.js',
+        'library_xlib.js',
+        'library_egl.js',
+        'library_glfw.js',
+        'library_uuid.js',
+        'library_glew.js',
+        'library_idbstore.js',
+        'library_async.js'
       ]);
-
-      if (!MINIMAL_RUNTIME) {
-        libraries = libraries.concat([
-          'library_sdl.js',
-          'library_glut.js',
-          'library_xlib.js',
-          'library_egl.js',
-          'library_glfw.js',
-          'library_uuid.js',
-          'library_glew.js',
-          'library_idbstore.js',
-          'library_async.js'
-        ]);
+    } else {
+      if (EMTERPRETIFY_ASYNC || ASYNCIFY) {
+        libraries.push('library_async.js');
+      }
+      if (USE_SDL == 1) {
+        libraries.push('library_sdl.js');
+      }
+      if (USE_SDL == 2) {
+        libraries.push('library_egl.js', 'library_webgl.js');
       }
     }
 
-    // If there are any explicitly specified system JS libraries to link to, add those to link.
-    if (SYSTEM_JS_LIBRARIES) {
-      libraries = libraries.concat(SYSTEM_JS_LIBRARIES.split(','));
+    // Add any explicitly specified system JS libraries to link to, add those to link.
+    libraries = libraries.concat(SYSTEM_JS_LIBRARIES)
+
+    if (LZ4) {
+      libraries.push('library_lz4.js');
     }
 
     if (USE_WEBGL2) {
@@ -141,13 +142,9 @@ var LibraryManager = {
       libraries.push('library_glemu.js');
     }
 
-    libraries = libraries.concat(additionalLibraries);
-
     if (BOOTSTRAPPING_STRUCT_INFO) libraries = ['library_bootstrap_structInfo.js', 'library_formatString.js'];
-    if (ONLY_MY_CODE) {
-      libraries.length = 0;
-      LibraryManager.library = {};
-    }
+
+    // TODO: deduplicate libraries (not needed for correctness, but avoids unnecessary work)
 
     // Save the list for has() queries later.
     this.libraries = libraries;
@@ -192,8 +189,8 @@ var LibraryManager = {
       if (typeof lib[x] === 'string') {
         var target = x;
         while (typeof lib[target] === 'string') {
-          // ignore code, aliases are just simple names
-          if (lib[target].search(/[({; ]/) >= 0) continue libloop;
+          // ignore code and variable assignments, aliases are just simple names
+          if (lib[target].search(/[=({; ]/) >= 0) continue libloop;
           // ignore trivial pass-throughs to Math.*
           if (lib[target].indexOf('Math_') == 0) continue libloop;
           target = lib[target];
@@ -274,7 +271,7 @@ var LibraryManager = {
   }
 };
 
-if (!BOOTSTRAPPING_STRUCT_INFO && !ONLY_MY_CODE) {
+if (!BOOTSTRAPPING_STRUCT_INFO) {
   // Load struct and define information.
   var temp = JSON.parse(read(STRUCT_INFO));
   C_STRUCTS = temp.structs;
@@ -310,7 +307,8 @@ function isExportedByForceFilesystem(name) {
          name === 'FS_unlink' ||
          name === 'getMemory' ||
          name === 'addRunDependency' ||
-         name === 'removeRunDependency';
+         name === 'removeRunDependency' ||
+         name === 'calledRun';
 }
 
 // export parts of the JS runtime that the user asked for
@@ -346,9 +344,9 @@ function exportRuntime() {
         extra = '. Alternatively, forcing filesystem support (-s FORCE_FILESYSTEM=1) can export this for you';
       }
       if (!isNumber) {
-        return 'if (!Module["' + name + '"]) Module["' + name + '"] = function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") };';
+        return 'if (!Object.getOwnPropertyDescriptor(Module, "' + name + '")) Module["' + name + '"] = function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") };';
       } else {
-        return 'if (!Module["' + name + '"]) Object.defineProperty(Module, "' + name + '", { get: function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") } });';
+        return 'if (!Object.getOwnPropertyDescriptor(Module, "' + name + '")) Object.defineProperty(Module, "' + name + '", { configurable: true, get: function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") } });';
       }
     }
     return '';
@@ -405,7 +403,6 @@ function exportRuntime() {
     'FS_unlink',
     'GL',
     'dynamicAlloc',
-    'warnOnce',
     'loadDynamicLibrary',
     'loadWebAssemblyModule',
     'getLEB',
@@ -427,23 +424,30 @@ function exportRuntime() {
     'printErr',
     'getTempRet0',
     'setTempRet0',
+    'callMain',
+    'abort',
   ];
 
   if (!MINIMAL_RUNTIME) {
     runtimeElements.push('Pointer_stringify');
+    runtimeElements.push('warnOnce');
   }
 
-  if (MODULARIZE) {
-    // In MODULARIZE=1 mode, the following functions need to be exported out to Module for worker.js to access.
-    if (STACK_OVERFLOW_CHECK) {
-      runtimeElements.push('writeStackCookie');
-      runtimeElements.push('checkStackCookie');
-      runtimeElements.push('abortStackOverflow');
-    }
-    if (USE_PTHREADS) {
-      runtimeElements.push('PThread');
-      runtimeElements.push('ExitStatus');
-    }
+  if (STACK_OVERFLOW_CHECK) {
+    runtimeElements.push('writeStackCookie');
+    runtimeElements.push('checkStackCookie');
+    runtimeElements.push('abortStackOverflow');
+  }
+
+  if (USE_PTHREADS) {
+    // In pthreads mode, the following functions always need to be exported to
+    // Module for closure compiler, and also for MODULARIZE (so worker.js can
+    // access them).
+    ['PThread', 'ExitStatus', 'tempDoublePtr', 'wasmMemory', '_pthread_self',
+     'ExitStatus', 'tempDoublePtr'].forEach(function(x) {
+      EXPORTED_RUNTIME_METHODS_SET[x] = 1;
+      runtimeElements.push(x);
+    });
   }
 
   if (SUPPORT_BASE64_EMBEDDING) {
@@ -464,6 +468,7 @@ function exportRuntime() {
     'ALLOC_STACK',
     'ALLOC_DYNAMIC',
     'ALLOC_NONE',
+    'calledRun',
   ];
   if (ASSERTIONS) {
     // check all exported things exist, warn about typos
@@ -487,6 +492,7 @@ var PassManager = {
       Functions: Functions,
       EXPORTED_FUNCTIONS: EXPORTED_FUNCTIONS,
       STATIC_BUMP: STATIC_BUMP, // updated with info from JS
+      DYNAMICTOP_PTR: DYNAMICTOP_PTR,
       ATINITS: ATINITS.join('\n'),
       ATMAINS: ATMAINS.join('\n'),
       ATEXITS: ATEXITS.join('\n'),
@@ -513,3 +519,16 @@ var PassManager = {
     */
   }
 };
+
+// Given a list of dependencies, maybe add GL to it, if it was linked in
+// (note that the item with this list of dependencies should not call GL code
+// if it is not; this just avoids even adding a dependency that would error).
+// This only matters in strict mode (specifically AUTO_JS_LIBRARIES=0), as in
+// non-strict mode the GL library is always linked in anyhow.
+function maybeAddGLDep(deps) {
+  if (AUTO_JS_LIBRARIES ||
+      SYSTEM_JS_LIBRARIES.indexOf('library_webgl.js') >= 0) {
+    deps.push('$GL');
+  }
+  return deps;
+}
